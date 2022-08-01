@@ -1,9 +1,12 @@
 import torch
 import torch.nn as nn
+from models.decoder import Decoder
+from models.encoder import Encoder
 from models.utils import (
     DecoderPostnet,
     DecoderPrenet,
     EncoderPreNet,
+    Linear,
     PositionalEncodingWithAlpha,
 )
 
@@ -21,6 +24,7 @@ class TransformerTTS(nn.Module):
         ffnn_size: int = 1024,
         mel_size: int = 80,
         rate: float = 0.2,
+        norm_first: bool = False,
     ):
         super(TransformerTTS, self).__init__()
 
@@ -34,11 +38,13 @@ class TransformerTTS(nn.Module):
         self.ffnn_size = ffnn_size
         self.mel_size = mel_size
         self.rate = rate
+        self.norm_first = norm_first
 
         self.build_model()
 
     def build_model(self):
         self.embedding = nn.Embedding(self.vocab_size, self.embedding_size, 0)
+
         self.encoder_prenet = EncoderPreNet(
             self.embedding_size, self.kernel_size, self.hidden_size, self.rate
         )
@@ -47,64 +53,88 @@ class TransformerTTS(nn.Module):
             self.hidden_size,
             self.rate,
         )
-        self.postional_encoding = PositionalEncodingWithAlpha(
+
+        self.encoder_pe = PositionalEncodingWithAlpha(
+            self.hidden_size, self.rate, self.max_position_embedding
+        )
+        self.decoder_pe = PositionalEncodingWithAlpha(
             self.hidden_size, self.rate, self.max_position_embedding
         )
 
-        self.transformer = nn.Transformer(
-            d_model=self.hidden_size,
-            nhead=self.num_heads,
-            num_encoder_layers=self.num_layers,
-            num_decoder_layers=self.num_layers,
-            dim_feedforward=self.ffnn_size,
-            dropout=self.rate,
-            batch_first=True,
-            norm_first=False,
+        self.encoder = Encoder(
+            hidden_size=self.hidden_size,
+            num_heads=self.num_heads,
+            num_layers=self.num_layers,
+            ffnn_size=self.ffnn_size,
+            rate=self.rate,
+            norm_first=self.norm_first,
+        )
+        self.decoder = Decoder(
+            hidden_size=self.hidden_size,
+            num_heads=self.num_heads,
+            num_layers=self.num_layers,
+            ffnn_size=self.ffnn_size,
+            rate=self.rate,
+            norm_first=self.norm_first,
         )
 
-        self.mel_linear = nn.Linear(self.hidden_size, self.mel_size)
-        self.postnet = DecoderPostnet(self.mel_size, self.kernel_size)
-        self.stop_linear = nn.Linear(self.hidden_size, 1)
+        self.mel_linear = Linear(self.hidden_size, self.mel_size)
+        self.postnet = DecoderPostnet(
+            self.mel_size,
+            self.hidden_size,
+            self.kernel_size,
+        )
+        self.stop_linear = Linear(self.hidden_size, 1, w_init="sigmoid")
 
-    def create_padding_mask(self, inputs):
+    def get_padding_mask(self, inputs):
         return inputs == 0
 
-    def create_decoder_mask(self, size):
-        return torch.triu(torch.ones((size, size)) * float("-inf"), diagonal=1)
+    def get_decoder_mask(self, size):
+        return torch.triu(torch.full((size, size), -float("inf")).float(), diagonal=1)
+        # return torch.triu(torch.ones((size, size)).bool(), diagonal=1)
 
     def forward(
         self,
         input_ids,
-        mel_spectrogram,
+        input_mel,
         attention_mask=None,
         decoder_attention_mask=None,
     ):
-        if mel_spectrogram.size(-1) != self.mel_size:
-            mel_spectrogram = mel_spectrogram.permute(0, 2, 1)
+
+        if input_mel.size(-1) != self.mel_size:
+            input_mel = input_mel.permute(0, 2, 1)
 
         embedding = self.embedding(input_ids)
         encoder_input = self.encoder_prenet(embedding)
-        encoder_input = self.postional_encoding(encoder_input)
+        encoder_input = self.encoder_pe(encoder_input)
 
-        decoder_input = self.decoder_prenet(mel_spectrogram)
-        decoder_input = self.postional_encoding(decoder_input)
+        decoder_input = self.decoder_prenet(input_mel)
+        decoder_input = self.decoder_pe(decoder_input)
 
-        if attention_mask is None:
-            attention_mask = self.create_padding_mask(input_ids)
-        if decoder_attention_mask is None:
-            decoder_attention_mask = self.create_padding_mask(mel_spectrogram[:, :, 0])
+        device = input_ids.device
 
-        transformer_output = self.transformer(
-            encoder_input,
+        if self.training:
+            if attention_mask is None:
+                attention_mask = self.get_padding_mask(input_ids).to(device)
+            if decoder_attention_mask is None:
+                decoder_attention_mask = self.get_padding_mask(input_mel[:, :, 0]).to(
+                    device
+                )
+            d_lh_mask = self.get_decoder_mask(decoder_input.size(1)).to(device)
+        else:
+            d_lh_mask = None
+
+        encoder_output, e_scores = self.encoder(encoder_input, attention_mask)
+        decoder_output, d_scores, de_scores = self.decoder(
             decoder_input,
-            src_key_padding_mask=attention_mask,
-            tgt_key_padding_mask=decoder_attention_mask,
-            tgt_mask=self.create_decoder_mask(decoder_input.size(1)),
+            encoder_output,
+            decoder_attention_mask,
+            d_lh_mask,
+            attention_mask,
         )
 
-        mel_output = self.mel_linear(transformer_output)
-        mel_output += self.postnet(mel_output)
-        stop_output = self.stop_linear(transformer_output)
-        stop_output = torch.sigmoid(stop_output)
+        mel_output = self.mel_linear(decoder_output)
+        mel_post_output = mel_output + self.postnet(mel_output)
+        stop_output = self.stop_linear(decoder_output)
 
-        return mel_output, stop_output
+        return mel_output, mel_post_output, stop_output, e_scores, d_scores, de_scores

@@ -1,110 +1,125 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from models.utils import PositionalEncoding
+from models.utils import Linear
 
 
-class DecoderPrenet(nn.Module):
+class DecoderLayer(nn.Module):
     def __init__(
         self,
-        mel_size: int = 80,
         hidden_size: int = 256,
-        rate: float = 0.1,
+        num_heads: int = 8,
+        ffnn_size: int = 1024,
+        rate: float = 0.2,
+        norm_first: bool = False,
     ):
-        super(DecoderPrenet, self).__init__()
+        super(DecoderLayer, self).__init__()
 
-        self.blocks = nn.ModuleList()
-        for i in range(2):
-            self.blocks.append(
-                nn.Sequential(
-                    nn.Linear(mel_size if i == 0 else hidden_size, hidden_size),
-                    nn.ReLU(),
-                    nn.Dropout(rate),
-                )
-            )
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.ffnn_size = ffnn_size
+        self.rate = rate
+        self.norm_first = norm_first
 
-    def forward(self, x):
-        for layer in self.blocks:
-            x = layer(x)
-        return x
+        self.build_model()
 
-
-class DecoderPostnet(nn.Module):
-    def __init__(
-        self,
-        mel_size: int = 80,
-        filter_size: int = 5,
-        rate: float = 0.1,
-    ):
-        super(DecoderPostnet, self).__init__()
-
-        self.blocks = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.Conv1d(mel_size, mel_size, filter_size, padding="same"),
-                    nn.Tanh(),
-                    nn.BatchNorm1d(),
-                )
-                for _ in range(5)
-            ]
+    def build_model(self):
+        self.mha1 = nn.MultiheadAttention(
+            self.hidden_size,
+            self.num_heads,
+            dropout=self.rate,
+            batch_first=True,
+        )
+        self.mha2 = nn.MultiheadAttention(
+            self.hidden_size,
+            self.num_heads,
+            dropout=self.rate,
+            batch_first=True,
+        )
+        self.ffnn = nn.Sequential(
+            Linear(self.hidden_size, self.ffnn_size, w_init="relu"),
+            nn.ReLU(),
+            nn.Dropout(self.rate),
+            Linear(self.ffnn_size, self.hidden_size),
         )
 
-    def forward(self, x):
-        for layer in self.blocks:
-            x = layer(x)
-        return x
+        self.norm1 = nn.LayerNorm(self.hidden_size)
+        self.norm2 = nn.LayerNorm(self.hidden_size)
+        self.norm3 = nn.LayerNorm(self.hidden_size)
+
+        self.dropout1 = nn.Dropout(self.rate)
+        self.dropout2 = nn.Dropout(self.rate)
+        self.dropout3 = nn.Dropout(self.rate)
+
+    def forward(self, x, e_output, mask=None, lh_mask=None, encoder_mask=None):
+        if self.norm_first:
+            x = self.norm1(x)
+            attn, score1 = self.mha1(x, x, x, attn_mask=lh_mask, key_padding_mask=mask)
+            x = self.dropout1(attn) + x
+
+            x = self.norm1(x)
+            attn, score2 = self.mha2(
+                x, e_output, e_output, key_padding_mask=encoder_mask
+            )
+            x = self.dropout1(attn) + x
+
+            x = self.norm2(x)
+            ffnn = self.ffnn(x)
+            output = self.dropout2(ffnn) + x
+
+        else:
+            attn, score1 = self.mha1(x, x, x, attn_mask=lh_mask, key_padding_mask=mask)
+            x = self.norm1(self.dropout1(attn) + x)
+
+            attn, score2 = self.mha2(
+                x, e_output, e_output, key_padding_mask=encoder_mask
+            )
+            ffnn = self.ffnn(x)
+            output = self.norm2(self.dropout2(ffnn) + x)
+
+        return output, score1, score2
 
 
-class Dncoder(nn.Module):
+class Decoder(nn.Module):
     def __init__(
         self,
-        mel_size: int = 80,
-        max_position_embedding: int = 512,
         hidden_size: int = 256,
         num_heads: int = 8,
         num_layers: int = 6,
         ffnn_size: int = 1024,
-        filter_size: int = 5,
-        rate: float = 0.1,
+        rate: float = 0.2,
+        norm_first: bool = False,
     ):
-        super(Dncoder, self).__init__()
+        super(Decoder, self).__init__()
 
-        self.mel_size = mel_size
-        self.max_position_embedding = max_position_embedding
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.num_layers = num_layers
         self.ffnn_size = ffnn_size
-        self.filter_size = filter_size
         self.rate = rate
+        self.norm_first = norm_first
 
-        self.prenet = DecoderPrenet(mel_size, hidden_size, rate)
-        self.postional_encoding = PositionalEncoding(
-            hidden_size, rate, max_position_embedding
-        )
-        self.transformer_decoder = nn.TransformerDecoder(
-            nn.TransformerDecoderLayer(
-                hidden_size, num_heads, ffnn_size, rate, batch_first=True
-            ),
-            num_layers,
-        )
-        self.mel_linear = nn.Linear(hidden_size, mel_size)
-        self.postnet = DecoderPostnet(mel_size, filter_size)
-        self.stop_linear = nn.Linear(hidden_size, 1)
+        self.build_model()
 
-    def forward(
-        self,
-        encoder_output,
-        spectrogram,
-        attention_mask,
-        decoder_attention_mask,
-    ):
-        x = self.prenet(spectrogram)
-        x = self.postional_encoding(x)
-
-        self.transformer_decoder(
-            x,
-            encoder_output,
-            decoder_attention_mask,
-            attention_mask,
+    def build_model(self):
+        self.layers = nn.ModuleList(
+            [
+                DecoderLayer(
+                    self.hidden_size,
+                    self.num_heads,
+                    self.ffnn_size,
+                    self.rate,
+                    self.norm_first,
+                )
+                for _ in range(self.num_layers)
+            ]
         )
+
+    def forward(self, x, e_output, mask=None, lh_mask=None, encoder_mask=None):
+        self_attn_scores = []
+        encoder_attn_scores = []
+        for layer in self.layers:
+            x, score1, score2 = layer(x, e_output, mask, lh_mask, encoder_mask)
+            self_attn_scores.append(score1.unsqueeze(0))
+            encoder_attn_scores.append(score2.unsqueeze(0))
+
+        return x, torch.cat(self_attn_scores), torch.cat(encoder_attn_scores)

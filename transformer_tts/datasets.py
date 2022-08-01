@@ -26,20 +26,39 @@ class TextMelDataset(Dataset):
     def __getitem__(self, index: slice):
         sample = torch.load(self.files[index])
 
-        input_ids = self.tokenizer.encode(
-            sample["text"], max_length=self.max_ids_length
+        encoded = self.tokenizer(
+            sample["text"],
+            max_length=self.max_ids_length,
+            return_tensors="pt",
         )
-        input_ids = torch.nn.functional.pad(
-            input_ids, (0, self.max_ids_length - input_ids.size(-1))
-        )
-        spectrogram = sample["mel_spectrogram"]
+        input_ids = encoded["input_ids"][0]
+        attention_mask = encoded["attention_mask"][0]
 
-        spectrogram = torch.nn.functional.pad(
-            spectrogram,
-            (0, self.max_spectrogram_length - spectrogram.size(-1)),
+        mel = sample["mel_spectrogram"][:, : self.max_spectrogram_length]
+        mel_mask_origin = sample["mel_mask"][:, : self.max_spectrogram_length]
+        input_mel = torch.nn.functional.pad(
+            torch.concat([torch.zeros((mel.size(0), 1)), mel[:, :-1]], dim=1),
+            (0, self.max_spectrogram_length - mel.size(-1)),
         )
+        mel_label = torch.nn.functional.pad(
+            mel,
+            (0, self.max_spectrogram_length - mel.size(-1)),
+        )
+        mel_mask = torch.full(input_mel.size(), True)
+        mel_mask[:, : mel.size(-1)] = mel_mask_origin
 
-        return input_ids, spectrogram
+        stop_label = torch.zeros(input_mel.size(-1), dtype=torch.float32)
+        stop_label[mel.size(-1) - 1] = 1
+
+        return (
+            {
+                "input_ids": input_ids,
+                "input_mel": input_mel,
+                "attention_mask": attention_mask,
+                "decoder_attention_mask": mel_mask[0],
+            },
+            {"mel_label": mel_label, "stop_label": stop_label},
+        )
 
 
 def get_datasets(
@@ -57,8 +76,8 @@ def get_datasets(
     for path in data_dir:
         files += glob.glob(os.path.join(path, "*.pt"))
 
-    rd.seed(seed)
-    rd.shuffle(files)
+    # rd.seed(seed)
+    # rd.shuffle(files)
 
     if train_ratio is not None:
         train_size = int(len(files) * train_ratio)

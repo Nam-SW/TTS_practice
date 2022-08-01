@@ -1,87 +1,106 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from models.utils import PositionalEncoding
+from models.utils import Linear
 
 
-class EncoderPreNet(nn.Module):
+class EncoderLayer(nn.Module):
     def __init__(
         self,
-        embedding_size: int = 512,
-        kernel_size: int = 5,
         hidden_size: int = 256,
-        rate: float = 0.1,
+        num_heads: int = 8,
+        ffnn_size: int = 1024,
+        rate: float = 0.2,
+        norm_first: bool = False,
     ):
-        super(EncoderPreNet, self).__init__()
+        super(EncoderLayer, self).__init__()
 
-        self.blocks = nn.ModuleList()
-        for _ in range(3):
-            self.blocks.append(
-                nn.Sequential(
-                    nn.Conv1d(
-                        embedding_size,
-                        embedding_size,
-                        kernel_size,
-                        padding="same",
-                    ),
-                    nn.BatchNorm1d(embedding_size),
-                    nn.ReLU(),
-                    nn.Dropout(rate),
-                )
-            )
-        self.blocks.append(nn.Linear(embedding_size, hidden_size))
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.ffnn_size = ffnn_size
+        self.rate = rate
+        self.norm_first = norm_first
 
-    def forward(self, x):
-        for layer in self.blocks:
-            x = layer(x)
-        return x
+        self.build_model()
+
+    def build_model(self):
+        self.mha = nn.MultiheadAttention(
+            self.hidden_size,
+            self.num_heads,
+            dropout=self.rate,
+            batch_first=True,
+        )
+        self.ffnn = nn.Sequential(
+            Linear(self.hidden_size, self.ffnn_size, w_init="relu"),
+            nn.ReLU(),
+            nn.Dropout(self.rate),
+            Linear(self.ffnn_size, self.hidden_size),
+        )
+
+        self.norm1 = nn.LayerNorm(self.hidden_size)
+        self.norm2 = nn.LayerNorm(self.hidden_size)
+
+        self.dropout1 = nn.Dropout(self.rate)
+        self.dropout2 = nn.Dropout(self.rate)
+
+    def forward(self, x, mask=None):
+        if self.norm_first:
+            x = self.norm1(x)
+            attn, score = self.mha(x, x, x, key_padding_mask=mask)
+            x = self.dropout1(attn) + x
+
+            x = self.norm2(x)
+            ffnn = self.ffnn(x)
+            output = self.dropout2(ffnn) + x
+
+        else:
+            attn, score = self.mha(x, x, x, key_padding_mask=mask)
+            x = self.norm1(self.dropout1(attn) + x)
+
+            ffnn = self.ffnn(x)
+            output = self.norm2(self.dropout2(ffnn) + x)
+
+        return output, score
 
 
 class Encoder(nn.Module):
     def __init__(
         self,
-        vocab_size: int,
-        embedding_size: int = 512,
-        max_position_embedding: int = 512,
-        kernel_size: int = 512,
         hidden_size: int = 256,
         num_heads: int = 8,
         num_layers: int = 6,
         ffnn_size: int = 1024,
-        rate: float = 0.1,
+        rate: float = 0.2,
+        norm_first: bool = False,
     ):
         super(Encoder, self).__init__()
 
-        self.vocab_size = vocab_size
-        self.embedding_size = embedding_size
-        self.max_position_embedding = max_position_embedding
-        self.kernel_size = kernel_size
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.num_layers = num_layers
         self.ffnn_size = ffnn_size
         self.rate = rate
+        self.norm_first = norm_first
 
-        self.embedding = nn.Embedding(vocab_size, embedding_size, 0)
-        self.prenet = EncoderPreNet(embedding_size, kernel_size, hidden_size, rate)
-        self.postional_encoding = PositionalEncoding(
-            hidden_size, rate, max_position_embedding
+        self.build_model()
+
+    def build_model(self):
+        self.layers = nn.ModuleList(
+            [
+                EncoderLayer(
+                    self.hidden_size,
+                    self.num_heads,
+                    self.ffnn_size,
+                    self.rate,
+                    self.norm_first,
+                )
+                for _ in range(self.num_layers)
+            ]
         )
-        self.transformer_encoder = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                hidden_size, num_heads, ffnn_size, rate, batch_first=True
-            ),
-            num_layers,
-        )
 
-    def forward(self, input_ids, attention_mask=None):
-        embedding = self.embedding(input_ids)
-        prenet_output = self.prenet(embedding)
-        prenet_output = self.postional_encoding(prenet_output)
+    def forward(self, x, mask=None):
+        scores = []
+        for layer in self.layers:
+            x, score = layer(x, mask)
+            scores.append(score.unsqueeze(0))
 
-        if attention_mask is None:
-            attention_mask = torch.ne(input_ids, 0).to(input_ids.device)
-
-        output = self.transformer_encoder(prenet_output, attention_mask)
-
-        return output
+        return x, torch.cat(scores)
